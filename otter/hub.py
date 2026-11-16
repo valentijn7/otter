@@ -281,6 +281,7 @@ def forecast(
     revision: Optional[str] = None,
     ensemble_members: Optional[int] = None,
     seed: int = DEFAULT_SEED,
+    stream_to_zarr: bool = False,
 ) -> None:
     """Forecast from ERA5 initial conditions, and save it as a zarr.
 
@@ -306,6 +307,8 @@ def forecast(
         ensemble_members: Size of an MC dropout model's ensemble. Defaults
             to the size it was validated with.
         seed: Seeds the dropout of MC dropout ensembles.
+        stream_to_zarr: Write each selected lead/member to Zarr immediately,
+            avoiding full-forecast output buffers on GPU and CPU.
     """
     model, config = load_pretrained(
         repo_id_or_path,
@@ -338,6 +341,7 @@ def forecast(
         headline_only=headline_only,
         lead_frequency_hours=lead_frequency_hours,
         num_ensemble_members=ensemble_members,
+        stream_to_zarr=stream_to_zarr,
     )
 
 
@@ -467,6 +471,7 @@ def main(args_list: Optional[list[str]] = None) -> None:
         help="Size of an MC dropout model's ensemble.",
     )
     forecast_parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    forecast_parser.add_argument("--stream_to_zarr", action="store_true")
 
     args = parser.parse_args(args_list)
     if args.command == "export":
@@ -497,6 +502,7 @@ def main(args_list: Optional[list[str]] = None) -> None:
             revision=args.revision,
             ensemble_members=args.ensemble_members,
             seed=args.seed,
+            stream_to_zarr=args.stream_to_zarr,
         )
 
 

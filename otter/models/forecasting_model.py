@@ -1,5 +1,6 @@
 from typing import (
     Any,
+    Iterator,
     List,
     Optional,
     Sequence,
@@ -311,51 +312,91 @@ class ForecastingModel(torch.nn.Module):
             The prediction distribution of shape (batch, lat, lon,
                 trg_time_idx, trg_var_and_level).
         """
-        num_rollout_steps = np.max(
-            (trg_timedelta_hours // self.temporal_resolution_hours)
+        predictions: List[Distribution] = []
+        all_load_balancing_losses: List[LoadBalancingLosses] = []
+        for lead, prd_dist, losses in self._rollout_steps(
+            ctx, zero_time, trg_timedelta_hours, grad_ckpt_start_timestep
+        ):
+            if lead in trg_timedelta_hours:
+                predictions.append(prd_dist)
+            if losses is not None:
+                all_load_balancing_losses.append(losses)
+
+        return (
+            product_distribution(predictions, dim=3),
+            all_load_balancing_losses,
         )
 
-        predictions: List[Distribution] = list()
-        all_load_balancing_losses: List[LoadBalancingLosses] = list()
-        for i in range(num_rollout_steps):
-            current_time = zero_time + i * self.temporal_resolution_timedelta
-
-            if i < grad_ckpt_start_timestep:
-                prd_dist, load_balancing_losses = self.single_time_forward(
+    def _rollout_steps(
+        self,
+        ctx: torch.Tensor,
+        zero_time: npt.NDArray[np.datetime64],
+        trg_timedelta_hours: npt.NDArray[np.int32],
+        grad_ckpt_start_timestep: int,
+    ) -> Iterator[tuple[int, Distribution, LoadBalancingLosses | None]]:
+        """ yield each normalized prediction after updating the context """
+        num_steps = int(np.max(
+            trg_timedelta_hours // self.temporal_resolution_hours
+        ))
+        for step in range(num_steps):
+            current_time = (
+                zero_time + step * self.temporal_resolution_timedelta
+            )
+            if step < grad_ckpt_start_timestep:
+                prd_dist, losses = self.single_time_forward(
                     ctx=ctx, zero_time=current_time
                 )
             else:
-                (prd_dist, load_balancing_losses) = checkpoint.checkpoint(
+                prd_dist, losses = checkpoint.checkpoint(
                     self.single_time_forward,
                     ctx,
                     current_time,
                     use_reentrant=False,
                 )
 
-            if (i + 1) * self.temporal_resolution_hours in trg_timedelta_hours:
-                predictions.append(prd_dist)
+            # Sampling must also happen at unsaved steps: it determines
+            # the next autoregressive input, including for Gaussian models.
+            ctx_next = ctx[..., :1, :].clone()
+            sample = prd_dist.sample().unsqueeze(-2)
+            ctx_next[..., 0:1, self.idx_ctx_for_update] = sample
+            ctx = torch.cat([ctx_next, ctx[..., :-1, :]], dim=3)
 
-            if load_balancing_losses is not None:
-                all_load_balancing_losses.append(load_balancing_losses)
+            lead = (step + 1) * self.temporal_resolution_hours
+            yield lead, prd_dist, losses
+            del prd_dist, losses, sample, ctx_next
 
-            # Using this prediction, update the context data for the next step.
-            # NOTE: We can't simply assign the prediction e.g. using
-            # ctx[..., 0, :] = prediction.reshape(...)
-            # because the prediction may contain fewer variables than the
-            # context data (e.g. static/known data).
-            ctx_next_time_frame = ctx[..., :1, :].clone()
+    def iter_forecast_means(
+        self, batch: ForecastingSample,
+    ) -> Iterator[tuple[int, torch.Tensor]]:
+        """ yield physical-unit means without retaining rollout history """
+        trg_timedelta_hours = batch.trg_timedelta_hours
+        if np.any(trg_timedelta_hours % self.temporal_resolution_hours != 0):
+            raise ValueError(
+                "All target times must be multiples of the temporal resolution"
+            )
 
-            # (batch, lat, lon, trg_var_and_level)
-            prd_sample = prd_dist.sample()
-            # (batch, lat, lon, 1, trg_var_and_level)
-            prd_sample = prd_sample.unsqueeze(-2)
-            ctx_next_time_frame[..., 0:1, self.idx_ctx_for_update] = prd_sample
+        ctx = (batch.ctx - self.ctx_mean) / self.ctx_std
+        expected_shape = (self.data_grid_num_lat, self.data_grid_num_lon)
+        if tuple(ctx.shape[1:3]) != expected_shape:
+            raise ValueError(
+                f"Expected lat-lon shapes: {expected_shape}, got "
+                f"{tuple(ctx.shape[1:3])}"
+            )
 
-            ctx = torch.cat([ctx_next_time_frame, ctx[..., :-1, :]], dim=3)
-
-        # Concat the time rollout steps along the time dimension
-        product_prd_dist = product_distribution(predictions, dim=3)
-        return product_prd_dist, all_load_balancing_losses
+        for lead, prediction, _ in self._rollout_steps(
+            ctx, batch.zero_time, trg_timedelta_hours,
+            grad_ckpt_start_timestep=9999,
+        ):
+            if lead in trg_timedelta_hours:
+                # Only the mean is saved. The distribution's sample was
+                # already used to update autoregressive context.
+                mean = (
+                    prediction.mean * self.trg_std[..., 0, :]
+                    + self.trg_mean[..., 0, :]
+                )
+                yield lead, mean
+                del mean
+            del prediction
 
 
 def make_forecasting_model(

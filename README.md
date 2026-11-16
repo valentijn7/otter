@@ -98,6 +98,8 @@ python -m otter.hub forecast <org>/<name> --init_time 2020-07-01T00 --output for
 ```
 This reads the initial conditions from the public WeatherBench2 ERA5 and writes a 10-day forecast, following WeatherBench2 conventions. Add `--end_init_time` to forecast from a range of inits, `--lead_time_hours`, `--headline_only` and `--lead_frequency_hours` to save less, and `--revision <commit hash>` to pin the model version. The config is instantiated with Hydra, which can run arbitrary code, so only load repos you trust.
 
+For high-resolution forecasts and ensembles, add `--stream_to_zarr` to write each selected lead/member directly to the output Zarr, with only one output lead staged on the CPU at a time. This keeps the original autoregressive sampling and outputs, but increases the number of write operations.
+
 To publish an experiment, log in with `hf auth login` (or set `HF_TOKEN`), then, on a machine with a GPU, run:
 ```bash
 python -m otter.hub export <experiment_name> hub_export/<name> \

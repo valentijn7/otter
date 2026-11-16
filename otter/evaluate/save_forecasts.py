@@ -8,6 +8,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 import xarray as xr
+import zarr
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 from tqdm import tqdm
@@ -107,6 +108,164 @@ def headline_fields(variables_and_levels: list[str]) -> list[int]:
     return fields
 
 
+def _resize_dimension(group: zarr.Group, dimension: str, size: int) -> None:
+    """ resize only arrays whose xarray dimensions include the named axis """
+    for name in group.array_keys():
+        array = group[name]
+        dimensions = list(array.attrs["_ARRAY_DIMENSIONS"])
+        if dimension in dimensions:
+            shape = list(array.shape)
+            shape[dimensions.index(dimension)] = size
+            array.resize(tuple(shape))
+
+
+def _write_forecast_region(
+    zarr_path: Path,
+    group: Any,
+    step: xr.Dataset,
+    lead_index: int,
+    selected_leads: list[int],
+    member_index: int | None,
+    num_members: int | None,
+    time_offset: int,
+) -> Any:
+    """ write one forecast lead/member directly to the final Zarr layout """
+    if group is None:
+        encoding: dict[str, dict[str, Any]] = {
+            "time": {
+                "units": "hours since 2020-01-01T00:00:00",
+                "dtype": "int64",
+            },
+            "prediction_timedelta": {"units": "hours", "dtype": "int64"},
+        }
+        for name, field in step.data_vars.items():
+            encoding[name] = {
+                "chunks": [
+                    1 if dim in (
+                        "time", "realization", "prediction_timedelta", "level"
+                    ) else size
+                    for dim, size in field.sizes.items()
+                ]
+            }
+        # Defer consolidation: stale metadata otherwise hides later resizes.
+        step.to_zarr(
+            zarr_path, mode="w", encoding=encoding,
+            zarr_format=2, consolidated=False,
+        )
+        group = zarr.open_group(
+            str(zarr_path), mode="a", use_consolidated=False,
+        )
+
+        # Resize each array once: separate resizes of lead and realization
+        # can restore the other's old size through cached array metadata.
+        for name in group.array_keys():
+            array = group[name]
+            dimensions = list(array.attrs["_ARRAY_DIMENSIONS"])
+            shape = list(array.shape)
+            if "prediction_timedelta" in dimensions:
+                shape[dimensions.index("prediction_timedelta")] = (
+                    len(selected_leads)
+                )
+            if num_members is not None and "realization" in dimensions:
+                shape[dimensions.index("realization")] = num_members
+            if tuple(shape) != array.shape:
+                array.resize(tuple(shape))
+
+        # The CF encodings above store timedelta coordinates in hours.
+        group["prediction_timedelta"][:] = selected_leads
+        if num_members is not None:
+            group["realization"][:] = np.arange(num_members)
+        return group
+
+    for name, field in step.data_vars.items():
+        region = []
+        for dimension in field.dims:
+            if dimension == "time":
+                region.append(
+                    slice(time_offset, time_offset + field.sizes["time"])
+                )
+            elif dimension == "prediction_timedelta":
+                region.append(slice(lead_index, lead_index + 1))
+            elif dimension == "realization":
+                if member_index is None:
+                    raise ValueError("Missing ensemble member index")
+                region.append(slice(member_index, member_index + 1))
+            else:
+                region.append(slice(None))
+        group[name][tuple(region)] = field.values
+    return group
+
+
+def _stream_batch_to_zarr(
+    model: ForecastingModel,
+    batch: Any,
+    zero_times: npt.NDArray[Any],
+    zarr_path: Path,
+    selected_leads: list[int],
+    fields: list[int],
+    variables_and_levels: list[str],
+    temporal_resolution_hours: int,
+    lats: npt.NDArray[Any],
+    lons: npt.NDArray[Any],
+    num_members: int | None,
+    time_offset: int,
+    group: Any,
+) -> Any:
+    """ stream each selected lead of each member without accumulating them """
+    positions = {lead: index for index, lead in enumerate(selected_leads)}
+    for member in range(num_members or 1):
+        seen = set()
+        with (
+            torch.no_grad(),
+            torch.amp.autocast("cuda", dtype=torch.float16),
+        ):
+            for lead, mean in model.iter_forecast_means(batch):
+                if lead not in positions:
+                    continue
+                frame = mean[..., fields].detach().cpu().numpy()
+                step = forecast_to_xarray(
+                    forecast=frame[..., None, :],
+                    zero_times=zero_times,
+                    temporal_resolution_hours=temporal_resolution_hours,
+                    variables_and_levels=variables_and_levels,
+                    lats=lats,
+                    lons=lons,
+                    lead_time_hours=[lead],
+                )
+                if num_members is not None:
+                    step = step.expand_dims(realization=[member])
+                for variable, factor in VARIABLES_WITH_SCALING_FACTORS.items():
+                    if variable in step:
+                        step[variable] = step[variable] / factor
+                group = _write_forecast_region(
+                    zarr_path, group, step, positions[lead], selected_leads,
+                    member if num_members is not None else None,
+                    num_members, time_offset,
+                )
+                seen.add(lead)
+                del frame, step
+        if seen != set(selected_leads):
+            raise ValueError("Missing selected leads in streamed forecast")
+    return group
+
+
+def _append_streamed_times(
+    group: Any,
+    zero_times: npt.NDArray[Any],
+    time_offset: int,
+) -> None:
+    """ extend the existing Zarr store for another initialization batch """
+    count = len(zero_times)
+    _resize_dimension(group, "time", time_offset + count)
+    offset_hours = (
+        zero_times.astype("datetime64[ns]")
+        - np.datetime64("2020-01-01T00:00:00", "ns")
+    ) / np.timedelta64(1, "h")
+    if not np.all(offset_hours == np.floor(offset_hours)):
+        raise ValueError("Forecast init time is not aligned to the hour")
+    group["time"][time_offset:time_offset + count] = offset_hours.astype(int)
+
+
 def generate_forecasts(
     experiment_name: str,
     model: ForecastingModel,
@@ -116,12 +275,17 @@ def generate_forecasts(
     headline_only: bool = False,
     lead_frequency_hours: int | None = None,
     num_ensemble_members: int | None = None,
+    stream_to_zarr: bool = False,
 ):
     """Forecast from each init in the dataloader, and save to zarr.
 
     With num_ensemble_members set, the model is run that many times per
     init, and the members are saved along a "realization" dimension. The
     model should then sample, e.g. with enable_mc_dropout.
+
+    stream_to_zarr writes one selected lead/member at a time to Zarr.
+    It bounds GPU and CPU output memory independent of horizon and members.
+    Training and the default inference path remain unchanged.
     """
     lats = ds.dataset.get_coord_by_name("latitude").values
     lons = ds.dataset.get_coord_by_name("longitude").values
@@ -144,22 +308,39 @@ def generate_forecasts(
     ]
     lead_time_hours = [all_lead_time_hours[i] for i in leads]
 
+    if not lead_time_hours:
+        raise ValueError("No selected forecast lead times")
+    if stream_to_zarr and zarr_path.exists():
+        raise FileExistsError(zarr_path)
+    group = None
+    time_offset = 0
+
     # Loop through the dataloader and save to Zarr
     for batch_idx, batch in tqdm(enumerate(dataloader)):
         zero_times = batch.zero_time
         print(f"Generating forecast with zero_time {zero_times}")
         batch = batch.to("cuda")
+        if stream_to_zarr:
+            if batch_idx:
+                _append_streamed_times(group, zero_times, time_offset)
+            group = _stream_batch_to_zarr(
+                model, batch, zero_times, zarr_path, lead_time_hours,
+                fields, variables_and_levels, temporal_resolution_hours,
+                lats, lons, num_ensemble_members, time_offset, group,
+            )
+            time_offset += len(zero_times)
+            continue
         members = []
         for _ in range(num_ensemble_members or 1):
             with (
                 torch.no_grad(),
                 torch.amp.autocast("cuda", dtype=torch.float16),
             ):
-                prd_dist, _ = model(batch=batch, grad_ckpt_start_timestep=9999)
-                # Select before copying off the GPU: at 0.25 degrees a whole
-                # forecast is ~14 GB.
+                prd_dist, _ = model(
+                    batch=batch, grad_ckpt_start_timestep=9999
+                )
                 prediction = prd_dist.mean[:, :, :, leads][..., fields]
-                forecast: npt.NDArray[Any] = prediction.cpu().numpy()
+                forecast = prediction.cpu().numpy()
             members.append(
                 forecast_to_xarray(
                     forecast=forecast,
@@ -211,6 +392,10 @@ def generate_forecasts(
             # Append to the existing zarr store along the 'time' dimension
             ds_batch.to_zarr(zarr_path, append_dim="time", zarr_format=2)
 
+    if stream_to_zarr and group is not None:
+        # Resizing metadata must be consolidated after the final write.
+        zarr.consolidate_metadata(str(zarr_path))
+
 
 # %%
 if __name__ == "__main__":
@@ -244,6 +429,10 @@ if __name__ == "__main__":
         default=None,
         help="Save only lead times that are multiples of this.",
     )
+    parser.add_argument(
+        "--stream_to_zarr", action="store_true",
+        help="Write each forecast lead/member to Zarr immediately.",
+    )
     args = parser.parse_args()
 
     experiment_name = args.experiment_name
@@ -272,6 +461,7 @@ if __name__ == "__main__":
             headline_only=args.headline_only,
             lead_frequency_hours=args.lead_frequency_hours,
             num_ensemble_members=mc_dropout_ensemble_size(config),
+            stream_to_zarr=args.stream_to_zarr,
         )
     else:
         logging.info(

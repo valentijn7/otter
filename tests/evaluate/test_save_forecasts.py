@@ -284,3 +284,187 @@ def test_mc_dropout_ensemble_size_reads_validation_config() -> None:
     assert (
         mc_dropout_ensemble_size(OmegaConf.create({"constants": {}})) is None
     )
+
+
+def test_streamed_inference_preserves_autoregressive_means() -> None:
+    """ compare both inference paths using the same stochastic samples """
+    from types import MethodType, SimpleNamespace
+
+    from otter.models.distributions import Delta, Gaussian
+    from otter.models.forecasting_model import ForecastingModel
+
+    for stochastic in (False, True):
+        model = ForecastingModel.__new__(ForecastingModel)
+        torch.nn.Module.__init__(model)
+        model.data_grid_num_lat = 2
+        model.data_grid_num_lon = 3
+        model.temporal_resolution_hours = 6
+        model.temporal_resolution_timedelta = np.timedelta64(6, "h")
+        model.ctx_mean = torch.zeros(1, 1, 1, 1, 1)
+        model.ctx_std = torch.ones(1, 1, 1, 1, 1)
+        model.trg_mean = torch.full((1, 1, 1, 1, 1), 3.0)
+        model.trg_std = torch.full((1, 1, 1, 1, 1), 2.0)
+        model.idx_ctx_for_update = [0]
+
+        def single_step(self, ctx, zero_time):
+            mean = ctx[..., 0, :] + 0.5
+            if stochastic:
+                return Gaussian(mean, torch.zeros_like(mean), 0.1), None
+            return Delta(mean), None
+
+        model.single_time_forward = MethodType(single_step, model)
+        batch = SimpleNamespace(
+            ctx=torch.zeros(1, 2, 3, 2, 1),
+            zero_time=np.array([np.datetime64("2020-07-01T00")]),
+            trg_timedelta_hours=np.array([6, 18, 24], dtype=np.int32),
+        )
+        with torch.no_grad():
+            torch.manual_seed(34)
+            regular, _ = model(batch, grad_ckpt_start_timestep=9999)
+            torch.manual_seed(34)
+            streamed = list(model.iter_forecast_means(batch))
+
+        assert [lead for lead, _ in streamed] == [6, 18, 24]
+        stacked = torch.stack([frame for _, frame in streamed], dim=3)
+        torch.testing.assert_close(stacked, regular.mean)
+
+
+def test_streamed_saver_keeps_leads_and_realizations(tmp_path: Path) -> None:
+    """ write each selected lead/member with the original output axes """
+    from otter.evaluate.save_forecasts import generate_forecasts
+
+    class StreamOnlyModel(MockModel):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, *args, **kwargs):
+            raise AssertionError("Streaming should not call full forward")
+
+        def iter_forecast_means(self, batch):
+            self.calls += 1
+            for lead in (6, 12, 18, 24):
+                mean = torch.full((1, 5, 10, 1), 10 * self.calls + lead)
+                yield lead, mean
+
+    ds = MockGriddedWeatherTask()
+    ds.target_timedeltas = ds.temporal_resolution * np.arange(1, 5)
+    model = StreamOnlyModel()
+    batch = MockBatch(zero_time=np.array([np.datetime64("2020-01-01")]))
+    output = tmp_path / "streamed.zarr"
+    generate_forecasts(
+        "test", model, [batch], ds, output,
+        lead_frequency_hours=12,
+        num_ensemble_members=3,
+        stream_to_zarr=True,
+    )
+
+    with xr.open_zarr(output) as saved:
+        saved = saved.load()
+    assert model.calls == 3
+    assert list(saved.realization.values) == [0, 1, 2]
+    assert list(saved.prediction_timedelta.values) == [
+        np.timedelta64(12, "h"), np.timedelta64(24, "h")
+    ]
+    actual = saved["2m_temperature"].isel(
+        time=0, latitude=0, longitude=0,
+    ).transpose("realization", "prediction_timedelta")
+    np.testing.assert_array_equal(actual, [[22, 34], [32, 44], [42, 54]])
+
+
+def test_direct_zarr_streaming_appends_dates_and_bounds_step_size(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """ keep a one-lead write size with multiple dates and ensemble members """
+    from otter.evaluate import save_forecasts
+
+    class StreamOnlyModel(MockModel):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, *args, **kwargs):
+            raise AssertionError("Full rollout was unexpectedly requested")
+
+        def iter_forecast_means(self, batch):
+            self.calls += 1
+            for lead in (6, 12, 18, 24):
+                yield lead, torch.full(
+                    (1, 5, 10, 1), self.calls * 100 + lead,
+                )
+
+    ds = MockGriddedWeatherTask()
+    ds.target_timedeltas = ds.temporal_resolution * np.arange(1, 5)
+    batches = [
+        MockBatch(zero_time=np.array([np.datetime64("2020-01-01")])),
+        MockBatch(zero_time=np.array([np.datetime64("2020-01-02")])),
+    ]
+    sizes = []
+    convert = save_forecasts.forecast_to_xarray
+
+    def limited_convert(*args, **kwargs):
+        sizes.append(kwargs["forecast"].shape)
+        return convert(*args, **kwargs)
+
+    monkeypatch.setattr(save_forecasts, "forecast_to_xarray", limited_convert)
+    model = StreamOnlyModel()
+    output = tmp_path / "streamed_dates.zarr"
+    save_forecasts.generate_forecasts(
+        "test", model, batches, ds, output,
+        num_ensemble_members=2, stream_to_zarr=True,
+    )
+    with xr.open_zarr(output) as stored:
+        stored = stored.load()
+    assert model.calls == 4
+    assert len(sizes) == 16
+    assert all(shape[3] == 1 for shape in sizes)
+    assert stored.sizes["time"] == 2
+    assert stored.sizes["realization"] == 2
+    assert stored.sizes["prediction_timedelta"] == 4
+    assert list(stored.time.values.astype("datetime64[D]")) == [
+        np.datetime64("2020-01-01"), np.datetime64("2020-01-02"),
+    ]
+    actual = stored["2m_temperature"].isel(
+        latitude=0, longitude=0,
+    ).transpose("time", "realization", "prediction_timedelta")
+    np.testing.assert_array_equal(actual[0], [
+        [106, 112, 118, 124], [206, 212, 218, 224],
+    ])
+    np.testing.assert_array_equal(actual[1], [
+        [306, 312, 318, 324], [406, 412, 418, 424],
+    ])
+    assert xr.open_zarr(output)["2m_temperature"].encoding["chunks"][-1] == 1
+
+
+def test_direct_zarr_streaming_matches_original_output(tmp_path: Path) -> None:
+    """ compare saved deterministic forecast fields and metadata """
+    from otter.evaluate.save_forecasts import generate_forecasts
+
+    class EquivalentModel(MockModel):
+        def __init__(self):
+            super().__init__()
+            self.values = torch.arange(4.0).reshape(1, 1, 1, 4, 1)
+            self.values = self.values.expand(1, 5, 10, 4, 1)
+
+        def forward(self, batch, grad_ckpt_start_timestep=9999):
+            return MockDistribution(self.values), []
+
+        def iter_forecast_means(self, batch):
+            for index, lead in enumerate((6, 12, 18, 24)):
+                yield lead, self.values[..., index, :]
+
+    ds = MockGriddedWeatherTask()
+    ds.target_timedeltas = ds.temporal_resolution * np.arange(1, 5)
+    batch = MockBatch(zero_time=np.array([np.datetime64("2020-01-01")]))
+    original = tmp_path / "original.zarr"
+    streamed = tmp_path / "direct.zarr"
+    model = EquivalentModel()
+    generate_forecasts("test", model, [batch], ds, original)
+    generate_forecasts(
+        "test", model, [batch], ds, streamed, stream_to_zarr=True,
+    )
+    with xr.open_zarr(original) as regular:
+        regular = regular.load()
+    with xr.open_zarr(streamed) as direct:
+        direct = direct.load()
+    xr.testing.assert_equal(direct, regular)
